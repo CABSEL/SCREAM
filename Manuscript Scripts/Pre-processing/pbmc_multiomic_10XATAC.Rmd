@@ -1,0 +1,349 @@
+---
+title: "Joint RNA and ATAC analysis: 10x multiomic"
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+options(future.globals.maxSize = 20 * 1024 ^ 3)
+```
+
+In this vignette, we'll demonstrate how to jointly analyze a single-cell dataset
+measuring both DNA accessibility and gene expression in the same cells using
+Signac and Seurat. In this vignette we'll be using a publicly available 10x
+Genomic Multiome dataset for human PBMCs.
+
+<details>
+  <summary>**View data download code**</summary>
+
+You can download the required data by running the following lines in a shell:
+
+</details>
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(glue)
+library(Signac)
+library(Seurat)
+library(ensembldb)
+library(AnnotationHub)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(rtracklayer)
+```
+
+```{r Define directories, echo=FALSE}
+mainDir <- "/scratch/g/tgu/svenkatesan/Other/atac_seq"
+inputDir <- file.path(mainDir, "inputfiles")
+rawDir <- file.path(inputDir, "raw")
+processedDir <- file.path(inputDir, "processed")
+resultsDir <- file.path(mainDir, "results")
+```
+
+```{r message=FALSE, warning=FALSE}
+# load the RNA and ATAC data	
+counts <- Seurat::Read10X_h5(file.path(rawDir, "pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5"))
+fragpath <- file.path(rawDir, "pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz")
+```
+
+```{r Query annotation files from Annotation Hub, echo=FALSE, warning=FALSE}
+ah <- AnnotationHub::AnnotationHub()
+print(AnnotationHub::snapshotDate(ah))
+# Search for the Ensembl 113 EnsDb for Homo sapiens on AnnotationHub
+all_ensdb <- ah %>% AnnotationHub::subset(., species == "Homo sapiens" & genome=="GRCh38" & rdataclass=="EnsDb")
+ensdb_df <- as.data.frame(AnnotationHub::mcols(all_ensdb)) %>% dplyr::arrange(desc(rdatadateadded)) %>% 
+  dplyr::slice_head(n=15)
+
+show(ensdb_df)
+```
+
+We choose AH119325: Ensembl 113 as the reference genome.
+```{r Read annotation file from Annotation Hub, echo=FALSE, results='hide', warning=FALSE, message=FALSE}
+genome_data <- all_ensdb[["AH119325"]]
+# print("Will retain only standard chromosomes: chr1-22, X, Y, MT")
+# print(GenomeInfoDb::genomeStyles("Homo_sapiens"))
+# genome_data <- ensembldb::addFilter(genome_data, 
+#                                     AnnotationFilter::AnnotationFilterList(AnnotationFilter::SeqNameFilter(GenomeInfoDb::genomeStyles("Homo_sapiens")$NCBI)))
+annotations <- Signac::GetGRangesFromEnsDb(ensdb = genome_data)
+GenomeInfoDb::seqlevelsStyle(annotations) <- "UCSC"
+```
+
+```{r message=FALSE, warning=FALSE}
+# create a Seurat object containing the RNA adata
+Seurat_obj <- Seurat::CreateSeuratObject(counts = counts["Gene Expression"], assay = "RNA")
+
+# create ATAC assay and add it to the object
+Seurat_obj[["ATAC"]] <- Signac::CreateChromatinAssay(counts = counts$Peaks, sep = c(":", "-"),
+                                                     fragments = fragpath, annotation = annotations)
+
+show(Seurat_obj)
+```
+
+## Quality control
+
+We can compute per-cell quality control metrics using the DNA accessibility data
+and remove cells that are outliers for these metrics, as well as cells with
+low or unusually high counts for either the RNA or ATAC assay.
+
+```{r fig.width=18, message=FALSE, warning=FALSE}
+Seurat::DefaultAssay(Seurat_obj) <- "ATAC"
+
+Seurat_obj <- Signac::NucleosomeSignal(Seurat_obj)
+Seurat_obj <- Signac::TSSEnrichment(Seurat_obj)
+```
+
+The relationship between variables stored in the object metadata can
+be visualized using the `DensityScatter()` function. This can also be used
+to quickly find suitable cutoff values for different QC metrics by setting
+`quantiles=TRUE`:
+
+```{r}
+plot1 <- Signac::DensityScatter(Seurat_obj, x ="nCount_ATAC", y = "TSS.enrichment", log_x = TRUE, quantiles = TRUE)
+show(plot1)
+```
+
+```{r fig.width=15}
+Seurat::DefaultAssay(Seurat_obj) <- "RNA"
+Seurat_obj[["percent.mt"]] <- Seurat::PercentageFeatureSet(Seurat_obj, pattern = "^MT-")
+plot1 <- Seurat::VlnPlot(object = Seurat_obj, features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal", "percent.mt"), ncol = 5, pt.size = 0)
+show(plot1)
+```
+
+```{r fig.width=15}
+# filter out low quality cells
+Seurat_obj <- subset(x = Seurat_obj, 
+                     subset = nCount_ATAC < 70000 &
+                       nCount_RNA < 25000 &
+                       nCount_ATAC > 5000 &
+                       nCount_RNA > 1000 &
+                       percent.mt < 20 &
+                       nucleosome_signal < 2 &
+                       TSS.enrichment > 1)
+show(Seurat_obj)
+
+plot1 <- Seurat::VlnPlot(object = Seurat_obj, features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal", "percent.mt"), ncol = 5, pt.size = 0)
+show(plot1)
+```
+<!-- ## Peak calling -->
+
+<!-- The set of peaks identified using Cellranger often merges distinct peaks that are -->
+<!-- close together. This can create a problem for certain analyses, particularly motif  -->
+<!-- enrichment analysis and peak-to-gene linkage. To identify a more accurate set of peaks, -->
+<!-- we can call peaks using MACS2 with the `CallPeaks()` function. Here we call peaks -->
+<!-- on all cells together, but we could identify peaks for each group of cells separately -->
+<!-- by setting the `group.by` parameter, and this can help identify peaks specific to -->
+<!-- rare cell populations.  -->
+
+<!-- ```{r include=FALSE} -->
+<!-- old_path <- Sys.getenv("PATH") -->
+<!-- Sys.setenv(PATH = paste(old_path, "/Users/stuartt/mambaforge/bin", sep = ":")) -->
+<!-- ``` -->
+
+<!-- # remove peaks on nonstandard chromosomes and in genomic blacklist regions -->
+<!-- peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse") -->
+<!-- peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE) -->
+<!-- ``` -->
+
+<!-- ```{r include=FALSE} -->
+<!-- gc() -->
+<!-- ``` -->
+
+<!-- ```{r message=FALSE, warning=FALSE} -->
+<!-- # quantify counts in each peak -->
+<!-- macs2_counts <- FeatureMatrix( -->
+<!--   fragments = Fragments(pbmc), -->
+<!--   features = peaks, -->
+<!--   cells = colnames(pbmc) -->
+<!-- ) -->
+<!-- ``` -->
+
+<!-- ```{r include=FALSE} -->
+<!-- gc() -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- # create a new assay using the MACS2 peak set and add it to the Seurat object -->
+<!-- pbmc[["peaks"]] <- CreateChromatinAssay( -->
+<!--   counts = macs2_counts, -->
+<!--   fragments = fragpath, -->
+<!--   annotation = annotation -->
+<!-- ) -->
+<!-- ``` -->
+
+## Gene expression data processing
+
+We can normalize the gene expression data using SCTransform, and reduce the dimensionality
+using PCA.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+Seurat::DefaultAssay(Seurat_obj) <- "RNA"
+Seurat_obj <- Seurat::SCTransform(Seurat_obj)
+Seurat_obj <- Seurat::RunPCA(Seurat_obj)
+```
+
+## DNA accessibility data processing
+
+Here we process the DNA accessibility assay the same way we would process a 
+scATAC-seq dataset, by performing latent semantic indexing (LSI).
+
+```{r message=FALSE, warning=FALSE}
+Seurat::DefaultAssay(Seurat_obj) <- "ATAC"
+Seurat_obj <- Signac::FindTopFeatures(Seurat_obj, min.cutoff = 5)
+Seurat_obj <- Signac::RunTFIDF(Seurat_obj)
+Seurat_obj <- Signac::RunSVD(Seurat_obj, n=300)
+```
+
+## Annotating cell types
+
+To annotate cell types in the dataset we can transfer cell labels from an existing
+PBMC reference dataset using tools in the Seurat package. See the
+Seurat reference mapping [vignette](https://satijalab.org/seurat/v4.0/reference_mapping.html)
+for more information.
+
+We'll use an annotated PBMC reference dataset from [Hao et al. (2020)](https://www.biorxiv.org/content/10.1101/2020.10.12.335331v1),
+available for download here: https://atlas.fredhutch.org/data/nygc/multimodal/pbmc_multimodal.h5seurat
+
+Note that the SeuratDisk package is required to load the reference dataset.
+Installation instructions for SeuratDisk can be found [here](https://github.com/mojaveazure/seurat-disk).
+
+```{r message=FALSE, warning=FALSE}
+# load PBMC reference
+reference <- readRDS(file.path(rawDir, "reference.rds"))
+reference <- Seurat::UpdateSeuratObject(reference)
+
+Seurat::DefaultAssay(Seurat_obj) <- "SCT"
+
+# transfer cell type labels from reference to query
+transfer_anchors <- Seurat::FindTransferAnchors(reference = reference,
+                                                query = Seurat_obj,
+                                                normalization.method = "SCT",
+                                                reference.reduction = "spca",
+                                                recompute.residuals = FALSE,
+                                                dims = 1:50)
+
+predictions <- Seurat::TransferData(anchorset = transfer_anchors, 
+                                    refdata = reference$celltype.l2,
+                                    weight.reduction = Seurat_obj[['pca']],
+                                    dims = 1:50)
+
+Seurat_obj <- Seurat::AddMetaData(object = Seurat_obj, metadata = predictions)
+
+# set the cell identities to the cell type predictions
+Seurat::Idents(Seurat_obj) <- "predicted.id"
+
+# remove low-quality predictions
+Seurat_obj <- Seurat_obj[, Seurat_obj$prediction.score.max > 0.5]
+```
+
+## Joint UMAP visualization
+
+Using the weighted nearest neighbor methods in [Seurat v4](https://www.biorxiv.org/content/10.1101/2020.10.12.335331v1),
+we can compute a joint neighbor graph that represent both the gene expression and 
+DNA accessibility measurements.
+
+```{r message=FALSE, warning=FALSE}
+# build a joint neighbor graph using both assays
+Seurat_obj <- Seurat::FindMultiModalNeighbors(object = Seurat_obj, reduction.list = list("pca", "lsi"), dims.list = list(1:50, 2:40), 
+                                              modality.weight.name = "RNA.weight", verbose = TRUE)
+
+# build a joint UMAP visualization
+Seurat_obj <- Seurat::RunUMAP(object = Seurat_obj, nn.name = "weighted.nn", assay = "RNA", verbose = TRUE)
+
+plot1 <- Seurat::DimPlot(Seurat_obj, label = TRUE, repel = TRUE, reduction = "umap") + Seurat::NoLegend()
+show(plot1)
+```
+```{r}
+table(Seurat_obj$predicted.id)
+```
+
+## Linking peaks to genes
+
+For each gene, we can find the set of peaks that may regulate the gene by by
+computing the correlation between gene expression and accessibility at nearby
+peaks, and correcting for bias due to GC content, overall accessibility, and 
+peak size. See the [Signac paper](https://www.biorxiv.org/content/10.1101/2020.11.09.373613v1)
+for a full description of the method we use to link peaks to genes.
+
+Running this step on the whole genome can be time consuming, so here we demonstrate
+peak-gene links for a subset of genes as an example. The same function can be used
+to find links for all genes by omitting the `genes.use` parameter:
+
+```{r message=FALSE, warning=FALSE}
+Seurat::DefaultAssay(Seurat_obj) <- "ATAC"
+
+# first compute the GC content for each peak
+Seurat_obj <- Signac::RegionStats(Seurat_obj, genome = BSgenome.Hsapiens.UCSC.hg38)
+
+# link peaks to genes
+Seurat_obj <- Signac::LinkPeaks(object = Seurat_obj, peak.assay = "ATAC", expression.assay = "SCT", genes.use = c("LYZ", "MS4A1"))
+```
+
+We can visualize these links using the `CoveragePlot()` function, or alternatively
+we could use the `CoverageBrowser()` function in an interactive analysis:
+
+```{r fig.height=10, message=FALSE, warning=FALSE}
+idents.plot <- c("B naive", "B intermediate", "B memory",
+                 "CD14 Mono", "CD16 Mono", "CD8 TEM", "CD8 Naive")
+
+Seurat_obj <- Signac::SortIdents(Seurat_obj)
+
+p1 <- Signac::CoveragePlot(object = Seurat_obj,
+                           region = "MS4A1",
+                           features = "MS4A1",
+                           expression.assay = "SCT",
+                           idents = idents.plot,
+                           extend.upstream = 500,
+                           extend.downstream = 10000)
+
+p2 <- Signac::CoveragePlot(object = Seurat_obj, region = "LYZ", features = "LYZ", expression.assay = "SCT",
+                           idents = idents.plot, extend.upstream = 8000, extend.downstream = 5000)
+
+patchwork::wrap_plots(p1, p2, ncol = 1)
+```
+
+```{r include=FALSE}
+saveRDS(Seurat_obj, file = file.path(processedDir, "pbmc_multiomic.rds"))
+```
+
+```{r Save RNA data and associated metadata}
+adata_rna <- anndataR::from_Seurat(seurat_obj = Seurat_obj, assay_name = "RNA", 
+                                   x_mapping = "counts", 
+                                   layers_mapping = list(counts = "counts"), 
+                                   obsm_mapping = list(pca = c("reductions", "pca"), 
+                                                       umap = c("reductions", "umap"), 
+                                                       lsi = c("reductions", "lsi")),
+                                   obsp_mapping = list(wnn = c("graphs", "wknn"), 
+                                                       wsnn = c("graphs", "wsnn")))
+adata_rna$var_names <- SeuratObject::Features(Seurat_obj, assay = "RNA")
+
+adata_rna$write_h5ad(file.path(processedDir, "pbmc_multiomic.h5ad"))
+```
+
+```{r}
+library(Matrix)
+
+atac_counts <- SeuratObject::GetAssayData(Seurat_obj, assay = "ATAC", layer = c("counts"))
+atac_data <- SeuratObject::GetAssayData(Seurat_obj, assay = "ATAC", layer = c("data"))
+rna_counts <- SeuratObject::GetAssayData(Seurat_obj, assay = "RNA", layer = c("counts"))[Features(Seurat_obj, assay = "SCT"),]
+rna_sct <- SeuratObject::GetAssayData(Seurat_obj, assay = "SCT", layer = c("data"))
+
+Matrix::writeMM(rna_counts, file.path(processedDir, "pbmc_multiomic_rnacounts.mtx"))
+Matrix::writeMM(atac_counts, file.path(processedDir, "pbmc_multiomic_ataccounts.mtx"))
+Matrix::writeMM(rna_sct, file.path(processedDir, "pbmc_multiomic_rnasct.mtx"))
+Matrix::writeMM(atac_data, file.path(processedDir, "pbmc_multiomic_atacdata.mtx"))
+
+atac_peaks <- rownames(atac_counts)
+write.table(atac_peaks, file = file.path(processedDir, "pbmc_multiomic_Seurat_peaks.tsv"),
+            sep = "\t", quote = FALSE, col.names = FALSE, row.names = FALSE)
+
+rna_genes <- rownames(rna_counts)
+write.table(rna_genes, file = file.path(processedDir, "pbmc_multiomic_Seurat_genes.tsv"),
+            sep = "\t", quote = FALSE, col.names = FALSE, row.names = FALSE)
+write.csv(Seurat_obj@meta.data, file.path(processedDir, "pbmc_multiomic_metadata.csv"))
+```
+
+```{r}
+write.csv(Seurat_obj@reductions$lsi@cell.embeddings %>% as.data.frame(), file.path(processedDir, "pbmc_multiomic_lsi.csv"))
+write.csv(Seurat_obj@reductions$pca@cell.embeddings %>% as.data.frame(), file.path(processedDir, "pbmc_multiomic_pca.csv"))
+write.csv(Seurat_obj@assays[["SCT"]]@var.features, file.path(processedDir, "pbmc_multiomic_varfeats.csv"))
+```
+
