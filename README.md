@@ -1,5 +1,5 @@
 # SCREAM: Single-cell Clustering using Representation Autoencoder of Multiomics
-
+<img src="docs/source/_static/SCREAM_logo.png" align="right" alt="SCREAM logo" width="180" />
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 SCREAM is a deep learning framework for robust integration and clustering of multi-modal single-cell data. The method leverages Stacked Autoencoders (SAEs) to generate robust latent representations for each omics modality and uses Deep Embedding Clustering (DEC) to iteratively refine the fused multiomics latent space and cluster assignments.
